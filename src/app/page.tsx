@@ -10,6 +10,8 @@ import { ENGINE_DISPLAY_NAME, LOCAL_ENGINE_DISPLAY_NAME } from "@/lib/engine-lab
 export const dynamic = "force-dynamic";
 
 export default async function Page() {
+  const backendAvailable =
+    databaseConfigured || Boolean(process.env.BACKEND_ORIGIN);
   const storage = storageInfo();
   const config: EngineConfig = {
     provider: geminiConfigured() ? "opal" : "local-engine",
@@ -24,5 +26,5 @@ export default async function Page() {
       : "Kite's local composer is ready. Describe what you want to build.",
   };
 
-  return <AuthGate databaseConfigured={databaseConfigured}><Studio initialProjects={[]} initialConfig={config} initialRate={null} /></AuthGate>;
+  return <AuthGate databaseConfigured={backendAvailable}><Studio initialProjects={[]} initialConfig={config} initialRate={null} /></AuthGate>;
 }

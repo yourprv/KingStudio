@@ -67,8 +67,8 @@ iframe, edit files directly, and export projects as ZIP files.
 
 The app requires the Kite database, PRV API URL, and both Kite SSO secrets before
 users can sign in. In PRV AI, run `backend/supabase/kite_sso.sql`, set the same
-`KITE_SSO_SHARED_SECRET` on the PRV backend, and set `VITE_KITE_STUDIO_URL` to
-Kite's production URL in the PRV frontend deployment. Every submitted generation
+`KITE_SSO_SHARED_SECRET` on the PRV backend, and set
+`VITE_KITE_STUDIO_URL=https://kitestudio-prvai.vercel.app` in the PRV frontend deployment. Every submitted generation
 turn, including plan-only and local-composer replies, uses one 2,000-credit
 request. Without a Gemini key, the built-in local composer remains available
 after sign-in.

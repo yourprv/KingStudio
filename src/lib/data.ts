@@ -13,7 +13,7 @@ import type { ProjectPlan } from "./agent/project-generator";
 import { removeFileObject, storageInfo, uploadFile } from "@/lib/storage";
 import { composeEdit, composeProject, detectStack } from "./agent/compose";
 import { geminiConfigured } from "./agent/gemini";
-import { QuotaError, reserveGeminiRequest, settleGeminiRequest } from "./agent/limiter";
+import { QuotaError, reserveGeminiRequest, reserveStudioRequest, settleGeminiRequest, type PlanTier } from "./agent/limiter";
 import { ENGINE_DISPLAY_NAME } from "./engine-labels";
 import {
   BATCH_OUTPUT_TOKENS,
@@ -35,14 +35,34 @@ type FileRow = typeof workspaceFiles.$inferSelect;
 type MessageRow = typeof messagesTable.$inferSelect;
 type MeteredResponse = { usage: { totalTokens: number } };
 
+function workspacePromptFiles(existing: WorkspaceFile[], generated: Array<{ path: string; language: string; content: string }>) {
+  const files = new Map(existing.map((file) => [file.path, {
+    path: file.path,
+    kind: file.kind,
+    language: file.language,
+    content: file.content,
+  }]));
+  for (const file of generated) {
+    files.set(file.path, {
+      path: file.path,
+      kind: "file",
+      language: file.language,
+      content: file.content,
+    });
+  }
+  return [...files.values()];
+}
+
 async function withReservedModelRequest<T extends MeteredResponse>(
   ownerId: string,
+  tier: PlanTier,
   estimatedInputTokens: number,
   outputTokenBudget: number,
   request: () => Promise<T>,
 ) {
-  const reservation = await reserveGeminiRequest(ownerId, estimatedInputTokens, outputTokenBudget);
+  const reservation = await reserveGeminiRequest(ownerId, tier, estimatedInputTokens, outputTokenBudget);
   if (!reservation.ok) throw new QuotaError(reservation);
+  if (!reservation.eventId) throw new Error("The model request reservation was not recorded.");
 
   let result: T;
   try {
@@ -213,7 +233,7 @@ export async function runAgent(
   projectId: string,
   ownerId: string,
   prompt: string,
-  options: { planOnly?: boolean } = {},
+  options: { planOnly?: boolean; tier?: PlanTier } = {},
 ): Promise<AgentRunOutcome | null> {
   const detail = await getProjectDetail(projectId, ownerId);
   if (!detail) return null;
@@ -222,6 +242,11 @@ export async function runAgent(
   const isEdit = existing.some((file) => file.kind === "file");
   const startedAt = Date.now();
   const storage = storageInfo();
+
+  // Every user-submitted Kite generation turn consumes one request and 2,000
+  // credits, including plan-only replies and the local fallback composer.
+  const requestReservation = await reserveStudioRequest(ownerId, options.tier ?? "free");
+  if (!requestReservation.ok) throw new QuotaError(requestReservation);
 
   if (options.planOnly) {
     const plan = isEdit
@@ -294,6 +319,7 @@ export async function runAgent(
       const planPrompt = prepareProjectPlan({ request: prompt, originalBrief, existingFiles: existing });
       projectPlan = await withReservedModelRequest(
         ownerId,
+        options.tier ?? "free",
         planPrompt.estimatedInputTokens,
         PLAN_OUTPUT_TOKENS,
         () => requestProjectPlan(planPrompt),
@@ -319,19 +345,23 @@ export async function runAgent(
         stack: projectPlan.stack,
         manifest: projectManifest,
         files: group,
-        existingFiles: existing,
+        existingFiles: workspacePromptFiles(existing, generated),
       });
       let batchFiles: Array<{ path: string; language: string; content: string }> = [];
+      let batchValidationErrors = new Map<string, string>();
       try {
         const batch = await withReservedModelRequest(
           ownerId,
+          options.tier ?? "free",
           preparedBatch.estimatedInputTokens,
           BATCH_OUTPUT_TOKENS,
           () => requestProjectFiles(preparedBatch, group),
         );
         batchFiles = batch.files;
+        batchValidationErrors = new Map(batch.invalidFiles.map((file) => [file.path, file.reason]));
       } catch (error) {
         if (error instanceof QuotaError) {
+          if (error.code === "prompt_too_large") throw error;
           if (resumableBuild && generated.length === 0) throw error;
           pauseReason = "The shared request allowance is full.";
         } else if (error instanceof Error && error.message === "GEMINI_RATE_LIMITED") {
@@ -349,22 +379,25 @@ export async function runAgent(
       const completedPaths = new Set(batchFiles.map((file) => file.path));
       const missingFiles = group.filter((file) => !completedPaths.has(file.path));
       for (const target of missingFiles) {
-        const prepared = prepareProjectFile({
-          request: prompt,
-          originalBrief,
-          projectName: projectPlan.name,
-          summary: projectPlan.summary,
-          stack: projectPlan.stack,
-          manifest: projectManifest,
-          file: target,
-          existingFiles: existing,
-        });
         try {
           let file: Awaited<ReturnType<typeof requestProjectFile>> | null = null;
+          let validationFeedback = batchValidationErrors.get(target.path) ?? "";
           for (let attempt = 0; attempt < 2 && !file; attempt += 1) {
             try {
+              const prepared = prepareProjectFile({
+                request: prompt,
+                originalBrief,
+                projectName: projectPlan.name,
+                summary: projectPlan.summary,
+                stack: projectPlan.stack,
+                manifest: projectManifest,
+                file: target,
+                existingFiles: workspacePromptFiles(existing, generated),
+                validationFeedback,
+              });
               file = await withReservedModelRequest(
                 ownerId,
+                options.tier ?? "free",
                 prepared.estimatedInputTokens,
                 FILE_OUTPUT_TOKENS,
                 () => requestProjectFile(prepared, target),
@@ -374,6 +407,7 @@ export async function runAgent(
                 throw error;
               }
               if (!(error instanceof Error) || !error.message.startsWith("MODEL_")) throw error;
+              validationFeedback = error.message;
               if (attempt === 1) throw error;
             }
           }
@@ -381,6 +415,7 @@ export async function runAgent(
           generated.push({ path: file.path, content: file.content, language: file.language });
         } catch (error) {
           if (error instanceof QuotaError) {
+            if (error.code === "prompt_too_large") throw error;
             if (resumableBuild && generated.length === 0) throw error;
             pauseReason = "The shared request allowance is full.";
           } else if (error instanceof Error && error.message === "GEMINI_RATE_LIMITED") {
@@ -526,7 +561,7 @@ export async function runAgent(
   };
 }
 
-export async function createProject(prompt: string, ownerId: string, planOnly = false) {
+export async function createProject(prompt: string, ownerId: string, planOnly = false, tier: PlanTier = "free") {
   const stack = detectStack(prompt);
   const draft = composeProject(prompt, stack);
 
@@ -543,7 +578,7 @@ export async function createProject(prompt: string, ownerId: string, planOnly = 
     .returning();
 
   try {
-    return await runAgent(created.id, ownerId, prompt, { planOnly });
+    return await runAgent(created.id, ownerId, prompt, { planOnly, tier });
   } catch (error) {
     await db.delete(projects).where(and(eq(projects.id, created.id), eq(projects.ownerId, ownerId)));
     throw error;

@@ -70,6 +70,72 @@ export function projectNameFor(prompt: string, stack: Stack): string {
   return ctx.title;
 }
 
+function withBrowserRuntime(files: GeneratedFile[], ctx: TemplateContext): GeneratedFile[] {
+  if (files.some((file) => file.path === "package.json")) return files;
+  const projectName = ctx.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "kite-project";
+  const packageJson = {
+    name: projectName,
+    version: "1.0.0",
+    private: true,
+    type: "module",
+    scripts: {
+      dev: "node dev-server.js",
+      start: "node dev-server.js",
+    },
+    dependencies: {},
+  };
+  const server = `import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { extname, resolve, sep } from "node:path";
+
+const root = process.cwd();
+const port = Number(process.env.PORT) || 4173;
+const mimeTypes = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".webp": "image/webp",
+};
+
+createServer(async (request, response) => {
+  try {
+    const url = new URL(request.url || "/", "http://localhost");
+    const requestPath = decodeURIComponent(url.pathname);
+    const relativePath = requestPath === "/" ? "index.html" : requestPath.replace(/^\\/+/, "");
+    const filePath = resolve(root, relativePath);
+    if (filePath !== root && !filePath.startsWith(root + sep)) {
+      response.writeHead(403).end("Forbidden");
+      return;
+    }
+
+    const fileInfo = await stat(filePath);
+    const actualPath = fileInfo.isDirectory() ? resolve(filePath, "index.html") : filePath;
+    const actualInfo = fileInfo.isDirectory() ? await stat(actualPath) : fileInfo;
+    if (!actualInfo.isFile()) throw new Error("Not a file");
+
+    response.setHeader("Content-Type", mimeTypes[extname(actualPath)] || "application/octet-stream");
+    response.writeHead(200);
+    createReadStream(actualPath).pipe(response);
+  } catch {
+    response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }).end("Not found");
+  }
+}).listen(port, "0.0.0.0", () => {
+  console.log("${ctx.title} is ready on port " + port);
+});
+`;
+
+  return [
+    { path: "package.json", language: "json", content: JSON.stringify(packageJson, null, 2) },
+    { path: "dev-server.js", language: "javascript", content: server },
+    ...files,
+  ];
+}
+
 function composeFiles(prompt: string, stack: Stack): { files: GeneratedFile[]; stack: Stack } {
   const ctx = contextFromPrompt(prompt);
   const p = prompt.toLowerCase();
@@ -78,19 +144,19 @@ function composeFiles(prompt: string, stack: Stack): { files: GeneratedFile[]; s
   if (stack === "node") return { files: nodeApiFiles(ctx), stack };
 
   if (/\b(hotel|resort|inn|lodge|hospitality)\b/.test(p))
-    return { files: hotelLandingFiles(ctx), stack };
+    return { files: withBrowserRuntime(hotelLandingFiles(ctx), ctx), stack };
 
   const wantsLanding = /landing page|pricing page|waitlist|product page|marketing site|homepage|saas|startup site/.test(p);
   if (!wantsLanding && /dashboard|admin panel|metrics|analytics overview/.test(p))
-    return { files: dashboardFiles(ctx), stack };
-  if (/calculator|calc app|keypad/.test(p)) return { files: calculatorFiles(ctx), stack };
+    return { files: withBrowserRuntime(dashboardFiles(ctx), ctx), stack };
+  if (/calculator|calc app|keypad/.test(p)) return { files: withBrowserRuntime(calculatorFiles(ctx), ctx), stack };
   if (/todo|task app|checklist|counter|habit/.test(p))
-    return { files: taskAppFiles(ctx), stack };
+    return { files: withBrowserRuntime(taskAppFiles(ctx), ctx), stack };
   if (/portfolio|resume|personal site|personal website|photograph/.test(p))
-    return { files: portfolioFiles(ctx), stack };
+    return { files: withBrowserRuntime(portfolioFiles(ctx), ctx), stack };
   if (wantsLanding || /landing|marketing|launch page/.test(p))
-    return { files: landingFiles(ctx), stack };
-  return { files: genericWebFiles(ctx), stack };
+    return { files: withBrowserRuntime(landingFiles(ctx), ctx), stack };
+  return { files: withBrowserRuntime(genericWebFiles(ctx), ctx), stack };
 }
 
 function summarize(prompt: string, stack: Stack, files: GeneratedFile[]) {

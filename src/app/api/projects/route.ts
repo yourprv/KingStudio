@@ -1,6 +1,6 @@
 import { createProject, listProjects } from "@/lib/data";
 import { getAuthenticatedUser, unauthorized } from "@/lib/auth/server";
-import { DAILY_LIMIT_RPD, getCreditSnapshot, getQuotaSnapshot, QuotaError, RATE_LIMIT_RPM, TOKEN_LIMIT_TPM } from "@/lib/agent/limiter";
+import { getCreditSnapshot, getQuotaSnapshot, QuotaError, TIER_LIMITS } from "@/lib/agent/limiter";
 import { geminiConfigured } from "@/lib/agent/gemini";
 import { ENGINE_DISPLAY_NAME, LOCAL_ENGINE_DISPLAY_NAME } from "@/lib/engine-labels";
 import { storageInfo } from "@/lib/storage";
@@ -17,17 +17,18 @@ export async function GET(request: Request) {
   try {
     const [projects, quota, credits] = await Promise.all([
       listProjects(user.id),
-      getQuotaSnapshot(),
-      getCreditSnapshot(user.id),
+      getQuotaSnapshot(user.id, user.tier),
+      getCreditSnapshot(user.id, user.tier),
     ]);
     const configured = geminiConfigured();
+    const limits = TIER_LIMITS[user.tier];
     const config: EngineConfig = {
       provider: configured ? "opal" : "local-engine",
       configured,
       model: configured ? ENGINE_DISPLAY_NAME : LOCAL_ENGINE_DISPLAY_NAME,
-      rpm: RATE_LIMIT_RPM,
-      tpm: TOKEN_LIMIT_TPM,
-      rpd: DAILY_LIMIT_RPD,
+      rpm: limits.rpm,
+      tpm: limits.tpm,
+      rpd: Math.floor(limits.dailyCredits / 2_000),
       storage: storageInfo(),
       hint: configured ? `${ENGINE_DISPLAY_NAME} is ready.` : "Kite's local composer is ready.",
     };
@@ -57,15 +58,15 @@ export async function POST(request: Request) {
   if (prompt.length > 40_000) return Response.json({ error: "Keep the build brief under 40,000 characters." }, { status: 413 });
 
   try {
-    const outcome = await createProject(prompt, user.id, planOnly);
+    const outcome = await createProject(prompt, user.id, planOnly, user.tier);
     if (!outcome) return Response.json({ error: "Could not create project" }, { status: 500 });
-    const [quota, credits] = await Promise.all([getQuotaSnapshot(), getCreditSnapshot(user.id)]);
+    const [quota, credits] = await Promise.all([getQuotaSnapshot(user.id, user.tier), getCreditSnapshot(user.id, user.tier)]);
     return Response.json({ detail: outcome.detail, rate: quota.rate, quota, credits, provider: outcome.provider });
   } catch (error) {
     if (error instanceof Error && error.message === "GEMINI_RATE_LIMITED") {
       const retryAfterMs = (error as Error & { retryAfterMs?: number }).retryAfterMs ?? 60_000;
       try {
-        const [quota, credits] = await Promise.all([getQuotaSnapshot(), getCreditSnapshot(user.id)]);
+        const [quota, credits] = await Promise.all([getQuotaSnapshot(user.id, user.tier), getCreditSnapshot(user.id, user.tier)]);
         return Response.json(
           { error: "rate_limited", message: "The request limit is reached — Kite is thinking and will retry.", retryAfterMs, rate: quota.rate, quota, credits },
           { status: 429, headers: { "Retry-After": String(Math.ceil(retryAfterMs / 1000)) } },

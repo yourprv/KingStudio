@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChatMessage, CreditSnapshot, EngineConfig, Project, ProjectDetail, QuotaSnapshot, RateSnapshot, WorkspaceFile } from "@/lib/types";
-import { apiFetch, getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { apiFetch } from "@/lib/supabase/client";
 import { buildPreviewDocument } from "@/lib/preview";
 import ChatPanel, { type ThinkingState } from "./ChatPanel";
 import CodePane from "./CodePane";
@@ -14,7 +14,9 @@ import Sidebar from "./Sidebar";
 import {
   ArrowLeft,
   Chevron,
+  Code,
   Download,
+  Eye,
   Flame,
   Gear,
   PanelLeft,
@@ -41,6 +43,11 @@ const pickEntryFile = (files: WorkspaceFile[]) =>
   files.find((file) => file.kind === "file") ??
   null;
 
+const hasChangedFiles = (detail: ProjectDetail) => {
+  const latestAgentMessage = [...detail.messages].reverse().find((message) => message.role === "agent");
+  return Boolean(latestAgentMessage?.meta?.files?.some((file) => file.action === "created" || file.action === "updated"));
+};
+
 export default function Studio({
   initialProjects,
   initialConfig,
@@ -55,10 +62,13 @@ export default function Studio({
   const [activeId, setActiveId] = useState<string | null>(null);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
   const [mode, setMode] = useState<"code" | "preview">("code");
+  const [previewNoticeOpen, setPreviewNoticeOpen] = useState(false);
+  const [runtimeRestartSignal, setRuntimeRestartSignal] = useState(0);
   const [mobilePane, setMobilePane] = useState<"chat" | "code">("code");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const lastRunChangedFilesRef = useRef(false);
   const [loadingProject, setLoadingProject] = useState(false);
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -126,6 +136,8 @@ export default function Studio({
   }, []);
 
   useEffect(() => {
+    // Initial data fetch; refreshProjects updates state after the network response.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refreshProjects();
   }, [refreshProjects]);
 
@@ -140,6 +152,8 @@ export default function Studio({
       setActiveId(id);
       const entry = pickEntryFile(data.detail.files);
       setActiveFileId(entry?.id ?? null);
+      setMode("code");
+      setPreviewNoticeOpen(false);
       setMobilePane("code");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load project.");
@@ -219,8 +233,9 @@ export default function Studio({
   );
 
   const handleSend = useCallback(
-    async (prompt: string, sendMode: ComposerMode) => {
-      if (busy) return;
+    async (prompt: string, sendMode: ComposerMode): Promise<boolean> => {
+      if (busy) return false;
+      lastRunChangedFilesRef.current = false;
       setError(null);
       setBusy(true);
       setPendingPrompt(prompt);
@@ -231,12 +246,15 @@ export default function Studio({
           const result = await runRequest("/api/projects", { prompt, planOnly: sendMode === "plan" });
           if (!result.ok) {
             setError(result.error);
-            return;
+            return false;
           }
           const next = result.data.detail;
+          lastRunChangedFilesRef.current = hasChangedFiles(next);
           setDetail(next);
           setActiveId(next.project.id);
           setActiveFileId(pickEntryFile(next.files)?.id ?? null);
+          setMode("code");
+          setPreviewNoticeOpen(false);
           setProjects((current) => [next.project, ...current.filter((p) => p.id !== next.project.id)]);
           setMobilePane("code");
           setToast(
@@ -265,10 +283,11 @@ export default function Studio({
           if (!result.ok) {
             setError(result.error);
             await loadProject(activeId);
-            return;
+            return false;
           }
 
           const next = result.data.detail;
+          lastRunChangedFilesRef.current = hasChangedFiles(next);
           setDetail(next);
           setActiveFileId((current) => {
             if (current && next.files.some((file) => file.id === current)) return current;
@@ -277,6 +296,7 @@ export default function Studio({
           void refreshProjects();
           setToast("Workspace updated");
         }
+        return true;
       } finally {
         setBusy(false);
         setPendingPrompt(null);
@@ -286,12 +306,49 @@ export default function Studio({
     [activeId, busy, loadProject, refreshProjects, runRequest],
   );
 
+  const runtimeFixPrompt = useCallback((logs: string) => [
+        "The project run failed. Use the original brief, current package.json, README instructions, relevant entry/config files, and existing source files to diagnose the terminal output below. Update the smallest complete set of project files so dependencies install and the dev server starts. Keep the product behavior and visual design unless the error requires a change.",
+        "",
+        "Terminal output:",
+        "```text",
+        logs,
+        "```",
+      ].join("\n"), []);
+
+  const handleRuntimeFix = useCallback(
+    async (logs: string) => {
+      const repaired = await handleSend(runtimeFixPrompt(logs), "build");
+      if (!repaired) return;
+      if (!lastRunChangedFilesRef.current) {
+        setError("Kite did not change any project files for this error. The current files were kept; use the terminal details to ask for a more specific fix.");
+        return;
+      }
+      setRuntimeRestartSignal((signal) => signal + 1);
+    },
+    [handleSend, runtimeFixPrompt],
+  );
+
+  const handleRuntimeAutoFix = useCallback(
+    async (logs: string) => {
+      const repaired = await handleSend(runtimeFixPrompt(logs), "build");
+      if (!repaired) return false;
+      if (!lastRunChangedFilesRef.current) {
+        setError("Kite did not change any project files for this error. The current files were kept; use the terminal details to ask for a more specific fix.");
+        return false;
+      }
+      setRuntimeRestartSignal((signal) => signal + 1);
+      return true;
+    },
+    [handleSend, runtimeFixPrompt],
+  );
+
   const handleNewProject = useCallback(() => {
     setActiveId(null);
     setDetail(null);
     setActiveFileId(null);
     setError(null);
     setMode("code");
+    setPreviewNoticeOpen(false);
     setSidebarOpen(false);
     setMobilePane("chat");
   }, []);
@@ -422,6 +479,22 @@ export default function Studio({
     setToast("Project downloaded as .zip");
   }, [detail]);
 
+  const showCode = useCallback(() => {
+    setMode("code");
+    setMobilePane("code");
+  }, []);
+
+  const requestPreview = useCallback(() => {
+    setMode("code");
+    setPreviewNoticeOpen(true);
+  }, []);
+
+  const continueToPreview = useCallback(() => {
+    setPreviewNoticeOpen(false);
+    setMode("preview");
+    setMobilePane("code");
+  }, []);
+
   const exportWorkspace = useCallback(async () => {
     const payload = [];
     for (const project of projects) {
@@ -448,7 +521,8 @@ export default function Studio({
       : `Postgres files · local workspace`;
 
   const signOut = useCallback(async () => {
-    await getSupabaseBrowserClient()?.auth.signOut();
+    await apiFetch("/api/auth/signout", { method: "POST" });
+    window.location.assign("/");
   }, []);
 
   return (
@@ -546,11 +620,34 @@ export default function Studio({
             <div className="flex items-center justify-between gap-2 border-b border-line bg-shell/50 px-3 py-1.5">
               <div className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-muted-dim">
                 <span>{detail.files.filter((file) => file.kind === "file").length} files</span>
-                <span className="h-1 w-1 rounded-full bg-line-strong" />
+                <span className="hidden h-1 w-1 rounded-full bg-line-strong sm:block" />
                 <span className="hidden sm:inline">Prompt: {detail.project.prompt.slice(0, 54)}</span>
-                <span className="sm:hidden">Updated just now</span>
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex shrink-0 items-center gap-1">
+                <div role="tablist" aria-label="Project view" className="flex rounded-md border border-line p-0.5">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === "code"}
+                    onClick={showCode}
+                    className={`flex items-center gap-1 rounded px-2 py-1 text-[10.5px] transition ${
+                      mode === "code" ? "bg-panel-3 text-cream" : "text-muted hover:text-cream"
+                    }`}
+                  >
+                    <Code size={11} /> Code
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={mode === "preview" || previewNoticeOpen}
+                    onClick={requestPreview}
+                    className={`flex items-center gap-1 rounded px-2 py-1 text-[10.5px] transition ${
+                      mode === "preview" || previewNoticeOpen ? "bg-panel-3 text-cream" : "text-muted hover:text-cream"
+                    }`}
+                  >
+                    <Eye size={11} /> Preview
+                  </button>
+                </div>
                 <div className="flex rounded-md border border-line p-0.5 lg:hidden">
                   <button
                     type="button"
@@ -617,11 +714,15 @@ export default function Studio({
                   />
                 </div>
                 <CodePane
+                  projectId={activeId}
+                  runtimeRestartSignal={runtimeRestartSignal}
+                  agentBusy={busy}
+                  onFixRuntimeError={handleRuntimeFix}
+                  onAutoFixRuntimeError={handleRuntimeAutoFix}
                   files={detail.files}
                   activeFile={activeFile}
                   mode={mode}
                   previewDoc={previewDoc}
-                  onMode={setMode}
                   onSelectId={(id) => {
                     setActiveFileId(id);
                     setMode("code");
@@ -724,6 +825,61 @@ export default function Studio({
         accountEmail={accountEmail}
         onSignOut={() => void signOut()}
       />
+
+      {previewNoticeOpen && detail ? (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+          onClick={() => setPreviewNoticeOpen(false)}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="preview-notice-title"
+            className="w-full max-w-[460px] rounded-2xl border border-line-strong bg-panel p-5 shadow-[0_28px_90px_-28px_rgba(0,0,0,0.9)]"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl border border-gold/25 bg-gold/10 text-gold">
+                <Download size={16} />
+              </span>
+              <div>
+                <h2 id="preview-notice-title" className="text-[14px] font-medium text-cream">
+                  Recommended: run this project in your IDE
+                </h2>
+                <p className="mt-2 text-[12px] leading-relaxed text-muted">
+                  Download the project, follow its README instructions in your IDE, and paste any errors into this chat. Kite keeps this project’s original brief and saved files in context to help fix them. Browser preview can still run many projects, but some need local services or packages that WebContainers do not support.
+                </p>
+              </div>
+            </div>
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={() => setPreviewNoticeOpen(false)}
+                className="rounded-lg border border-line px-3 py-2 text-[11.5px] text-muted transition hover:text-cream"
+              >
+                Stay in Code
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPreviewNoticeOpen(false);
+                  void downloadZip();
+                }}
+                className="flex items-center justify-center gap-1.5 rounded-lg border border-line-strong px-3 py-2 text-[11.5px] text-cream-soft transition hover:bg-panel-2 hover:text-cream"
+              >
+                <Download size={12} /> Download code
+              </button>
+              <button
+                type="button"
+                onClick={continueToPreview}
+                className="rounded-lg bg-[#d6c4ff] px-3 py-2 text-[11.5px] font-medium text-[#21162e] transition hover:bg-white"
+              >
+                Continue anyway
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       {toast ? (
         <div className="fade-up fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-full border border-line bg-panel-2/95 px-4 py-2 text-[11.5px] text-cream-soft shadow-[0_20px_50px_-20px_rgba(0,0,0,1)]">

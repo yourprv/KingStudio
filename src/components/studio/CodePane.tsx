@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { highlightLines, languageLabel } from "@/lib/highlight";
 import type { WorkspaceFile } from "@/lib/types";
+import RuntimePreview from "./RuntimePreview";
 import {
   Check,
   Chevron,
@@ -18,11 +19,15 @@ import {
 } from "./icons";
 
 type Props = {
+  projectId: string;
+  runtimeRestartSignal: number;
+  agentBusy: boolean;
+  onFixRuntimeError: (logs: string) => void;
+  onAutoFixRuntimeError: (logs: string) => Promise<boolean>;
   files: WorkspaceFile[];
   activeFile: WorkspaceFile | null;
   mode: "code" | "preview";
   previewDoc: string | null;
-  onMode: (mode: "code" | "preview") => void;
   onSelectId: (id: string) => void;
   onSave: (file: WorkspaceFile, content: string) => Promise<void> | void;
   onDelete: (file: WorkspaceFile) => void;
@@ -43,18 +48,30 @@ const iconFor = (name: string) => {
 };
 
 export default function CodePane({
+  projectId,
+  runtimeRestartSignal,
+  agentBusy,
+  onFixRuntimeError,
+  onAutoFixRuntimeError,
   files,
   activeFile,
   mode,
   previewDoc,
-  onMode,
   onSelectId,
   onSave,
   onDelete,
   onCreate,
 }: Props) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(activeFile?.content ?? "");
+  const activeFileKey = activeFile ? `${activeFile.id}:${activeFile.updatedAt}` : "";
+  const [editorState, setEditorState] = useState({
+    fileKey: activeFileKey,
+    draft: activeFile?.content ?? "",
+    editing: false,
+  });
+  const currentEditorState = editorState.fileKey === activeFileKey
+    ? editorState
+    : { fileKey: activeFileKey, draft: activeFile?.content ?? "", editing: false };
+  const { draft, editing } = currentEditorState;
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
@@ -62,11 +79,7 @@ export default function CodePane({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const realFiles = files.filter((file) => file.kind === "file");
-
-  useEffect(() => {
-    setDraft(activeFile?.content ?? "");
-    setEditing(false);
-  }, [activeFile?.id, activeFile?.content]);
+  const hasPackageJson = realFiles.some((file) => file.path.replace(/^\.\//, "") === "package.json");
 
   const lines = useMemo(
     () => highlightLines(editing ? draft : (activeFile?.content ?? ""), activeFile?.language ?? "plaintext"),
@@ -83,7 +96,7 @@ export default function CodePane({
     try {
       await onSave(activeFile, draft);
       setSavedAt(Date.now());
-      setEditing(false);
+      setEditorState({ fileKey: activeFileKey, draft, editing: false });
     } finally {
       setSaving(false);
     }
@@ -139,34 +152,15 @@ export default function CodePane({
         )}
 
         <div className="ml-auto flex items-center gap-1">
-          <div className="mr-1 flex rounded-md border border-line p-0.5">
-            <button
-              type="button"
-              onClick={() => onMode("code")}
-              className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition ${
-                mode === "code" ? "bg-panel-3 text-cream" : "text-muted hover:text-cream"
-              }`}
-            >
-              <Code size={11} />
-              Code
-            </button>
-            <button
-              type="button"
-              onClick={() => onMode("preview")}
-              className={`flex items-center gap-1 rounded px-2 py-1 text-[11px] transition ${
-                mode === "preview" ? "bg-panel-3 text-cream" : "text-muted hover:text-cream"
-              }`}
-            >
-              <Eye size={11} />
-              Preview
-            </button>
-          </div>
-
           {activeFile ? (
             <>
               <button
                 type="button"
-                onClick={() => (editing ? void save() : setEditing(true))}
+              onClick={() =>
+                editing
+                  ? void save()
+                  : setEditorState({ fileKey: activeFileKey, draft, editing: true })
+              }
                 title={editing ? "Save changes" : "Edit file"}
                 disabled={saving}
                 className={`grid h-7 w-7 place-items-center rounded border transition ${
@@ -214,13 +208,28 @@ export default function CodePane({
         </div>
       </div>
 
-      {mode === "preview" ? (
+      {hasPackageJson ? (
+        <div className={`min-h-0 flex-1 ${mode === "preview" ? "flex" : "hidden"}`}>
+          <RuntimePreview
+            key={projectId}
+            projectId={projectId}
+            files={files}
+            restartSignal={runtimeRestartSignal}
+            autoStart={mode === "preview"}
+            agentBusy={agentBusy}
+            onFixErrors={onFixRuntimeError}
+            onAutoFixErrors={onAutoFixRuntimeError}
+          />
+        </div>
+      ) : null}
+
+      {mode === "preview" && !hasPackageJson ? (
         previewDoc ? (
           <div className="flex min-h-0 flex-1 flex-col">
             <div className="flex items-center gap-2 border-b border-line bg-panel/60 px-3 py-1.5">
               <span className="flex items-center gap-1.5 text-[10px] text-muted">
                 <span className="h-1.5 w-1.5 rounded-full bg-[#a8c69a]" />
-                Sandboxed preview · index.html
+                Live HTML preview · index.html
               </span>
               <button
                 type="button"
@@ -244,12 +253,15 @@ export default function CodePane({
               <Eye size={18} />
             </div>
             <p className="max-w-[38ch] text-[13px] leading-relaxed text-muted">
-              This project has no <span className="font-mono text-cream-soft">index.html</span> entry
-              point, so there is nothing to render in the browser. Open the files to read the code.
+              This project has no <span className="font-mono text-cream-soft">index.html</span> or
+              <span className="font-mono text-cream-soft"> package.json</span> entry point to preview.
+              Open the files to read the code.
             </p>
           </div>
         )
-      ) : activeFile ? (
+      ) : null}
+
+      {mode === "code" && activeFile ? (
         <div className="relative flex min-h-0 flex-1 overflow-auto">
           <div className="sticky left-0 z-10 select-none border-r border-line bg-panel/70 px-2.5 py-3 text-right font-mono text-[11.5px] leading-[1.75] text-muted-dim">
             {(editing ? draft.split("\n") : activeFile.content.split("\n")).map((_, index) => (
@@ -262,13 +274,21 @@ export default function CodePane({
               ref={textareaRef}
               value={draft}
               spellCheck={false}
-              onChange={(event) => setDraft(event.target.value)}
+              onChange={(event) =>
+                setEditorState({ fileKey: activeFileKey, draft: event.target.value, editing: true })
+              }
               onKeyDown={(event) => {
                 if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
                   event.preventDefault();
                   void save();
                 }
-                if (event.key === "Escape") setEditing(false);
+                if (event.key === "Escape") {
+                  setEditorState({
+                    fileKey: activeFileKey,
+                    draft: activeFile?.content ?? "",
+                    editing: false,
+                  });
+                }
               }}
               className="min-h-full min-w-[560px] flex-1 resize-none whitespace-pre bg-transparent px-4 py-3 font-mono text-[11.5px] leading-[1.75] text-cream caret-gold focus:outline-none"
             />
@@ -290,7 +310,7 @@ export default function CodePane({
             </pre>
           )}
         </div>
-      ) : (
+      ) : mode === "code" ? (
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-8 text-center">
           <div className="grid h-11 w-11 place-items-center rounded-xl border border-line bg-panel-2 text-gold/70">
             <Code size={18} />
@@ -307,7 +327,7 @@ export default function CodePane({
             Create a file
           </button>
         </div>
-      )}
+      ) : null}
 
       {activeFile ? (
         <div className="flex items-center justify-between gap-3 border-t border-line bg-panel/60 px-3 py-1.5 font-mono text-[10px] text-muted-dim">

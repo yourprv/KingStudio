@@ -1,6 +1,6 @@
 import { and, asc, eq, gte, lt, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { accountCredits, generationEvents, providerLocks } from "@/db/schema";
+import { generationEvents, providerLocks, studioDailyUsage, studioRequestEvents } from "@/db/schema";
 import { GEMINI_MODEL } from "./gemini";
 
 const positiveLimit = (value: string | undefined, fallback: number) => {
@@ -8,13 +8,23 @@ const positiveLimit = (value: string | undefined, fallback: number) => {
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 };
 
+// These are upstream safeguards shared by all Kite users. User-facing plan caps
+// are enforced separately by TIER_LIMITS below.
 export const RATE_LIMIT_RPM = positiveLimit(process.env.GEMINI_RPM, 15);
 export const TOKEN_LIMIT_TPM = positiveLimit(process.env.GEMINI_TPM, 250_000);
 export const DAILY_LIMIT_RPD = positiveLimit(process.env.GEMINI_RPD, 500);
-export const INITIAL_CREDITS = 1_000_000;
 export const CREDITS_PER_REQUEST = 2_000;
 export const MAX_OUTPUT_TOKENS = 8_192;
 const WINDOW_MS = 60_000;
+
+export type PlanTier = "free" | "go" | "plus" | "pro";
+export type TierLimits = { dailyCredits: number; rpm: number; tpm: number };
+export const TIER_LIMITS: Record<PlanTier, TierLimits> = {
+  free: { dailyCredits: 200_000, rpm: 5, tpm: 100_000 },
+  go: { dailyCredits: 300_000, rpm: 10, tpm: 175_000 },
+  plus: { dailyCredits: 650_000, rpm: 15, tpm: 250_000 },
+  pro: { dailyCredits: 1_000_000, rpm: 15, tpm: 250_000 },
+};
 
 export type RateInfo = {
   used: number;
@@ -37,9 +47,9 @@ export type CreditSnapshot = {
   requestCost: number;
 };
 
-function minuteStart(now: Date) {
-  return new Date(now.getTime() - WINDOW_MS);
-}
+const minuteStart = (now: Date) => new Date(now.getTime() - WINDOW_MS);
+const utcDateKey = (date: Date) => date.toISOString().slice(0, 10);
+const nextUtcDay = (now: Date) => Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
 
 const providerTimeZone = "America/Los_Angeles";
 const providerCalendar = new Intl.DateTimeFormat("en-US", {
@@ -53,13 +63,11 @@ const providerCalendar = new Intl.DateTimeFormat("en-US", {
   hourCycle: "h23",
 });
 
-/** Provider daily request quota resets at midnight Pacific Time. */
+/** Shared upstream provider request quota resets at midnight Pacific Time. */
 function providerDayStart(now: Date) {
   const parts = Object.fromEntries(providerCalendar.formatToParts(now).map((part) => [part.type, Number(part.value)]));
   const target = Date.UTC(parts.year, parts.month - 1, parts.day);
   let candidate = target;
-
-  // Convert local calendar midnight to UTC, accounting for PST/PDT.
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const local = Object.fromEntries(providerCalendar.formatToParts(new Date(candidate)).map((part) => [part.type, Number(part.value)]));
     const localAsUtc = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute, local.second);
@@ -70,82 +78,92 @@ function providerDayStart(now: Date) {
   return new Date(candidate);
 }
 
-function nextProviderDay(now: Date) {
-  const currentStart = providerDayStart(now);
-  return providerDayStart(new Date(currentStart.getTime() + 36 * 60 * 60 * 1000));
-}
+const nextProviderDay = (now: Date) => providerDayStart(new Date(providerDayStart(now).getTime() + 36 * 60 * 60 * 1000));
 
-function nextWindowForTokens(events: Array<{ createdAt: Date; tokenBudget: number }>, needed: number) {
+function nextWindowForTokens(events: Array<{ createdAt: Date; tokenBudget: number }>, needed: number, limit: number) {
   const total = events.reduce((sum, item) => sum + item.tokenBudget, 0);
   let released = 0;
   for (const event of events) {
     released += event.tokenBudget;
-    if (total - released + needed <= TOKEN_LIMIT_TPM) {
-      return Math.max(1_000, event.createdAt.getTime() + WINDOW_MS - Date.now());
-    }
+    if (total - released + needed <= limit) return Math.max(1_000, event.createdAt.getTime() + WINDOW_MS - Date.now());
   }
   return Math.max(1_000, (events[0]?.createdAt.getTime() ?? Date.now()) + WINDOW_MS - Date.now());
 }
 
-export async function getQuotaSnapshot(): Promise<QuotaSnapshot> {
-  const now = new Date();
-  const minute = minuteStart(now);
-  const day = providerDayStart(now);
-  const [minuteRows, dailyRows] = await Promise.all([
-    db
-      .select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
-      .from(generationEvents)
-      .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
-      .orderBy(asc(generationEvents.createdAt)),
-    db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(generationEvents)
-      .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, day))),
-  ]);
-  const usedTokens = minuteRows.reduce((sum, item) => sum + item.tokenBudget, 0);
-  const requestUsed = minuteRows.length;
-  const dailyUsed = Number(dailyRows[0]?.count ?? 0);
-  const oldest = minuteRows[0]?.createdAt.getTime() ?? now.getTime();
-  const resetAt = minuteRows.length ? oldest + WINDOW_MS : now.getTime() + WINDOW_MS;
+function creditSnapshot(tier: PlanTier, creditsUsed: number, requestsUsed: number): CreditSnapshot {
+  const granted = TIER_LIMITS[tier].dailyCredits;
   return {
-    rate: {
-      used: requestUsed,
-      limit: RATE_LIMIT_RPM,
-      remaining: Math.max(0, RATE_LIMIT_RPM - requestUsed),
-      resetAt,
-    },
-    daily: {
-      used: dailyUsed,
-      limit: DAILY_LIMIT_RPD,
-      remaining: Math.max(0, DAILY_LIMIT_RPD - dailyUsed),
-      resetAt: nextProviderDay(now).getTime(),
-    },
-    tokens: {
-      used: usedTokens,
-      limit: TOKEN_LIMIT_TPM,
-      remaining: Math.max(0, TOKEN_LIMIT_TPM - usedTokens),
-      resetAt,
-    },
-  };
-}
-
-export async function getCreditSnapshot(userId: string): Promise<CreditSnapshot> {
-  await db
-    .insert(accountCredits)
-    .values({ userId, balance: INITIAL_CREDITS, creditsUsed: 0 })
-    .onConflictDoNothing();
-  const [account] = await db.select().from(accountCredits).where(eq(accountCredits.userId, userId)).limit(1);
-  return {
-    granted: INITIAL_CREDITS,
-    balance: account?.balance ?? INITIAL_CREDITS,
-    used: account?.creditsUsed ?? 0,
-    requestsUsed: Math.floor((account?.creditsUsed ?? 0) / CREDITS_PER_REQUEST),
+    granted,
+    balance: Math.max(0, granted - creditsUsed),
+    used: creditsUsed,
+    requestsUsed,
     requestCost: CREDITS_PER_REQUEST,
   };
 }
 
+function quotaFromRows(
+  tier: PlanTier,
+  now: Date,
+  requestRows: Array<{ createdAt: Date }>,
+  tokenRows: Array<{ createdAt: Date; tokenBudget: number }>,
+  dailyRequestsUsed: number,
+): QuotaSnapshot {
+  const limits = TIER_LIMITS[tier];
+  const usedTokens = tokenRows.reduce((sum, event) => sum + event.tokenBudget, 0);
+  const dailyLimit = Math.floor(limits.dailyCredits / CREDITS_PER_REQUEST);
+  return {
+    rate: {
+      used: requestRows.length,
+      limit: limits.rpm,
+      remaining: Math.max(0, limits.rpm - requestRows.length),
+      resetAt: requestRows.length ? requestRows[0].createdAt.getTime() + WINDOW_MS : now.getTime() + WINDOW_MS,
+    },
+    daily: {
+      used: dailyRequestsUsed,
+      limit: dailyLimit,
+      remaining: Math.max(0, dailyLimit - dailyRequestsUsed),
+      resetAt: nextUtcDay(now),
+    },
+    tokens: {
+      used: usedTokens,
+      limit: limits.tpm,
+      remaining: Math.max(0, limits.tpm - usedTokens),
+      resetAt: tokenRows.length ? tokenRows[0].createdAt.getTime() + WINDOW_MS : now.getTime() + WINDOW_MS,
+    },
+  };
+}
+
+export async function getQuotaSnapshot(userId: string, tier: PlanTier): Promise<QuotaSnapshot> {
+  const now = new Date();
+  const minute = minuteStart(now);
+  const [requestRows, tokenRows, [usage]] = await Promise.all([
+    db.select({ createdAt: studioRequestEvents.createdAt })
+      .from(studioRequestEvents)
+      .where(and(eq(studioRequestEvents.userId, userId), gte(studioRequestEvents.createdAt, minute)))
+      .orderBy(asc(studioRequestEvents.createdAt)),
+    db.select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
+      .from(generationEvents)
+      .where(and(eq(generationEvents.userId, userId), eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
+      .orderBy(asc(generationEvents.createdAt)),
+    db.select({ requestsUsed: studioDailyUsage.requestsUsed })
+      .from(studioDailyUsage)
+      .where(and(eq(studioDailyUsage.userId, userId), eq(studioDailyUsage.usageDate, utcDateKey(now))))
+      .limit(1),
+  ]);
+  return quotaFromRows(tier, now, requestRows, tokenRows, usage?.requestsUsed ?? 0);
+}
+
+export async function getCreditSnapshot(userId: string, tier: PlanTier): Promise<CreditSnapshot> {
+  const now = new Date();
+  const [usage] = await db.select({ creditsUsed: studioDailyUsage.creditsUsed, requestsUsed: studioDailyUsage.requestsUsed })
+    .from(studioDailyUsage)
+    .where(and(eq(studioDailyUsage.userId, userId), eq(studioDailyUsage.usageDate, utcDateKey(now))))
+    .limit(1);
+  return creditSnapshot(tier, usage?.creditsUsed ?? 0, usage?.requestsUsed ?? 0);
+}
+
 export type Reservation =
-  | { ok: true; eventId: string; credits: CreditSnapshot; quota: QuotaSnapshot }
+  | { ok: true; eventId?: string; credits: CreditSnapshot; quota: QuotaSnapshot }
   | {
       ok: false;
       code: "rate_limited" | "daily_quota" | "token_limit" | "prompt_too_large" | "credits_exhausted";
@@ -156,7 +174,7 @@ export type Reservation =
     };
 
 export class QuotaError extends Error {
-  code: "rate_limited" | "daily_quota" | "token_limit" | "prompt_too_large" | "credits_exhausted";
+  code: Extract<Reservation, { ok: false }>["code"];
   retryAfterMs: number;
   credits: CreditSnapshot;
   quota: QuotaSnapshot;
@@ -171,9 +189,82 @@ export class QuotaError extends Error {
   }
 }
 
-/** Atomically reserves credits and shared model quota before a provider request is sent. */
+/** Charges exactly one 2,000-credit unit per user-submitted build/edit/fix job. */
+export async function reserveStudioRequest(userId: string, tier: PlanTier): Promise<Reservation> {
+  const now = new Date();
+  const date = utcDateKey(now);
+  const minute = minuteStart(now);
+  const limits = TIER_LIMITS[tier];
+  const dayRequestLimit = Math.floor(limits.dailyCredits / CREDITS_PER_REQUEST);
+
+  return db.transaction(async (tx) => {
+    await tx.insert(studioDailyUsage)
+      .values({ userId, usageDate: date })
+      .onConflictDoNothing({ target: [studioDailyUsage.userId, studioDailyUsage.usageDate] });
+    const [usage] = await tx.select().from(studioDailyUsage)
+      .where(and(eq(studioDailyUsage.userId, userId), eq(studioDailyUsage.usageDate, date)))
+      .for("update");
+    if (!usage) throw new Error("Could not reserve the daily Kite allowance.");
+
+    await tx.delete(studioRequestEvents).where(lt(studioRequestEvents.createdAt, new Date(now.getTime() - 24 * 60 * 60 * 1_000)));
+    const [minuteRows, tokenRows] = await Promise.all([
+      tx.select({ createdAt: studioRequestEvents.createdAt })
+        .from(studioRequestEvents)
+        .where(and(eq(studioRequestEvents.userId, userId), gte(studioRequestEvents.createdAt, minute)))
+        .orderBy(asc(studioRequestEvents.createdAt)),
+      tx.select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
+        .from(generationEvents)
+        .where(and(eq(generationEvents.userId, userId), eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
+        .orderBy(asc(generationEvents.createdAt)),
+    ]);
+    const quota = quotaFromRows(tier, now, minuteRows, tokenRows, usage.requestsUsed);
+    const credits = creditSnapshot(tier, usage.creditsUsed, usage.requestsUsed);
+
+    if (usage.creditsUsed + CREDITS_PER_REQUEST > limits.dailyCredits) {
+      return {
+        ok: false as const,
+        code: "credits_exhausted" as const,
+        message: `Your ${tier} plan has used today's Kite credits. The allowance refreshes at midnight UTC; unused credits do not carry over.`,
+        retryAfterMs: Math.max(1_000, nextUtcDay(now) - now.getTime()),
+        credits,
+        quota,
+      };
+    }
+    if (minuteRows.length >= limits.rpm) {
+      const resetAt = minuteRows[0]?.createdAt.getTime() + WINDOW_MS || now.getTime() + WINDOW_MS;
+      return {
+        ok: false as const,
+        code: "rate_limited" as const,
+        message: `Your ${tier} plan allows ${limits.rpm} Kite requests per minute.`,
+        retryAfterMs: Math.max(1_000, resetAt - now.getTime()),
+        credits,
+        quota,
+      };
+    }
+
+    await tx.insert(studioRequestEvents).values({ userId, createdAt: now });
+    await tx.update(studioDailyUsage).set({
+      creditsUsed: usage.creditsUsed + CREDITS_PER_REQUEST,
+      requestsUsed: usage.requestsUsed + 1,
+      updatedAt: now,
+    }).where(eq(studioDailyUsage.id, usage.id));
+
+    return {
+      ok: true as const,
+      credits: creditSnapshot(tier, usage.creditsUsed + CREDITS_PER_REQUEST, usage.requestsUsed + 1),
+      quota: {
+        ...quota,
+        rate: { used: minuteRows.length + 1, limit: limits.rpm, remaining: Math.max(0, limits.rpm - minuteRows.length - 1), resetAt: minuteRows[0]?.createdAt.getTime() + WINDOW_MS || now.getTime() + WINDOW_MS },
+        daily: { used: usage.requestsUsed + 1, limit: dayRequestLimit, remaining: Math.max(0, dayRequestLimit - usage.requestsUsed - 1), resetAt: nextUtcDay(now) },
+      },
+    };
+  });
+}
+
+/** Reserves one underlying model call against shared provider and per-user TPM limits. */
 export async function reserveGeminiRequest(
   userId: string,
+  tier: PlanTier,
   estimatedInputTokens: number,
   outputTokenBudget = MAX_OUTPUT_TOKENS,
 ): Promise<Reservation> {
@@ -181,183 +272,89 @@ export async function reserveGeminiRequest(
   const minute = minuteStart(now);
   const day = providerDayStart(now);
   const requestedBudget = estimatedInputTokens + outputTokenBudget;
+  const limits = TIER_LIMITS[tier];
 
   return db.transaction(async (tx) => {
     await tx.insert(providerLocks).values({ model: GEMINI_MODEL }).onConflictDoNothing();
     await tx.select().from(providerLocks).where(eq(providerLocks.model, GEMINI_MODEL)).for("update");
     await tx.delete(generationEvents).where(lt(generationEvents.createdAt, day));
 
-    await tx
-      .insert(accountCredits)
-      .values({ userId, balance: INITIAL_CREDITS, creditsUsed: 0 })
-      .onConflictDoNothing();
-    const [account] = await tx
-      .select()
-      .from(accountCredits)
-      .where(eq(accountCredits.userId, userId))
-      .for("update");
+    const [providerEvents, [providerToday], userTokenEvents, userRequestRows, [usage]] = await Promise.all([
+      tx.select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
+        .from(generationEvents)
+        .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
+        .orderBy(asc(generationEvents.createdAt)),
+      tx.select({ count: sql<number>`count(*)::int` })
+        .from(generationEvents)
+        .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, day))),
+      tx.select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
+        .from(generationEvents)
+        .where(and(eq(generationEvents.userId, userId), eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
+        .orderBy(asc(generationEvents.createdAt)),
+      tx.select({ createdAt: studioRequestEvents.createdAt })
+        .from(studioRequestEvents)
+        .where(and(eq(studioRequestEvents.userId, userId), gte(studioRequestEvents.createdAt, minute)))
+        .orderBy(asc(studioRequestEvents.createdAt)),
+      tx.select({ creditsUsed: studioDailyUsage.creditsUsed, requestsUsed: studioDailyUsage.requestsUsed })
+        .from(studioDailyUsage)
+        .where(and(eq(studioDailyUsage.userId, userId), eq(studioDailyUsage.usageDate, utcDateKey(now))))
+        .limit(1),
+    ]);
+    const usedProviderTokens = providerEvents.reduce((sum, event) => sum + event.tokenBudget, 0);
+    const usedUserTokens = userTokenEvents.reduce((sum, event) => sum + event.tokenBudget, 0);
+    const providerTodayUsed = Number(providerToday?.count ?? 0);
+    const nextProviderRateAt = providerEvents[0]?.createdAt.getTime() + WINDOW_MS || now.getTime() + WINDOW_MS;
+    const userTokenReset = userTokenEvents[0]?.createdAt.getTime() + WINDOW_MS || now.getTime() + WINDOW_MS;
+    const credits = creditSnapshot(tier, usage?.creditsUsed ?? 0, usage?.requestsUsed ?? 0);
+    const userQuota = quotaFromRows(tier, now, userRequestRows, userTokenEvents, usage?.requestsUsed ?? 0);
 
-    const minuteEvents = await tx
-      .select({ createdAt: generationEvents.createdAt, tokenBudget: generationEvents.tokenBudget })
-      .from(generationEvents)
-      .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, minute)))
-      .orderBy(asc(generationEvents.createdAt));
-    const [today] = await tx
-      .select({ count: sql<number>`count(*)::int` })
-      .from(generationEvents)
-      .where(and(eq(generationEvents.model, GEMINI_MODEL), gte(generationEvents.createdAt, day)));
-
-    const usedTokens = minuteEvents.reduce((sum, event) => sum + event.tokenBudget, 0);
-    const quotaUsed = minuteEvents.length;
-    const todayUsed = Number(today?.count ?? 0);
-    const nextRateAt = (minuteEvents[0]?.createdAt.getTime() ?? now.getTime()) + WINDOW_MS;
-    const basicQuota: QuotaSnapshot = {
-      rate: {
-        used: quotaUsed,
-        limit: RATE_LIMIT_RPM,
-        remaining: Math.max(0, RATE_LIMIT_RPM - quotaUsed),
-        resetAt: nextRateAt,
-      },
-      daily: {
-        used: todayUsed,
-        limit: DAILY_LIMIT_RPD,
-        remaining: Math.max(0, DAILY_LIMIT_RPD - todayUsed),
-        resetAt: nextProviderDay(now).getTime(),
-      },
-      tokens: {
-        used: usedTokens,
-        limit: TOKEN_LIMIT_TPM,
-        remaining: Math.max(0, TOKEN_LIMIT_TPM - usedTokens),
-        resetAt: nextRateAt,
-      },
-    };
-
-    const accountSnapshot = (balance: number, used: number): CreditSnapshot => ({
-      granted: INITIAL_CREDITS,
-      balance,
-      used,
-      requestsUsed: Math.floor(used / CREDITS_PER_REQUEST),
-      requestCost: CREDITS_PER_REQUEST,
+    const fail = (code: Extract<Reservation, { ok: false }>['code'], message: string, retryAfterMs = 0): Reservation => ({
+      ok: false,
+      code,
+      message,
+      retryAfterMs,
+      credits,
+      quota: userQuota,
     });
 
-    if (todayUsed >= DAILY_LIMIT_RPD) {
-      return {
-        ok: false as const,
-        code: "daily_quota" as const,
-        message: "The shared daily request allowance is used. It resets at midnight Pacific Time.",
-        retryAfterMs: Math.max(1_000, nextProviderDay(now).getTime() - now.getTime()),
-        credits: accountSnapshot(account?.balance ?? INITIAL_CREDITS, account?.creditsUsed ?? 0),
-        quota: basicQuota,
-      };
+    if (providerTodayUsed >= DAILY_LIMIT_RPD) {
+      return fail("daily_quota", "Kite's shared model allowance is full for today.", Math.max(1_000, nextProviderDay(now).getTime() - now.getTime()));
     }
-    if (quotaUsed >= RATE_LIMIT_RPM) {
-      return {
-        ok: false as const,
-        code: "rate_limited" as const,
-        message: `The shared limit is ${RATE_LIMIT_RPM} requests per minute. Kite is holding this request.`,
-        retryAfterMs: Math.max(1_000, nextRateAt - now.getTime()),
-        credits: accountSnapshot(account?.balance ?? INITIAL_CREDITS, account?.creditsUsed ?? 0),
-        quota: basicQuota,
-      };
+    if (providerEvents.length >= RATE_LIMIT_RPM) {
+      return fail("rate_limited", "Kite's shared model request limit is busy.", Math.max(1_000, nextProviderRateAt - now.getTime()));
     }
-    if (estimatedInputTokens > TOKEN_LIMIT_TPM || requestedBudget > TOKEN_LIMIT_TPM) {
-      return {
-        ok: false as const,
-        code: "prompt_too_large" as const,
-        message: "This request is too large for the current per-minute token allowance. Shorten the brief or workspace context.",
-        retryAfterMs: 0,
-        credits: accountSnapshot(account?.balance ?? INITIAL_CREDITS, account?.creditsUsed ?? 0),
-        quota: basicQuota,
-      };
+    if (requestedBudget > TOKEN_LIMIT_TPM) {
+      return fail("prompt_too_large", "This model call is larger than Kite's shared provider token limit. Reduce the workspace context before retrying.");
     }
-    if (usedTokens + requestedBudget > TOKEN_LIMIT_TPM) {
-      return {
-        ok: false as const,
-        code: "token_limit" as const,
-        message: "The shared token allowance is busy. Kite is waiting for capacity.",
-        retryAfterMs: nextWindowForTokens(minuteEvents, requestedBudget),
-        credits: accountSnapshot(account?.balance ?? INITIAL_CREDITS, account?.creditsUsed ?? 0),
-        quota: basicQuota,
-      };
+    if (usedProviderTokens + requestedBudget > TOKEN_LIMIT_TPM) {
+      return fail("token_limit", "Kite's shared model token allowance is busy. Wait for capacity and retry.", nextWindowForTokens(providerEvents, requestedBudget, TOKEN_LIMIT_TPM));
     }
-    if (!account || account.balance < CREDITS_PER_REQUEST) {
-      return {
-        ok: false as const,
-        code: "credits_exhausted" as const,
-        message: "This account has used its available credits.",
-        retryAfterMs: 0,
-        credits: accountSnapshot(account?.balance ?? 0, account?.creditsUsed ?? 0),
-        quota: basicQuota,
-      };
+    if (requestedBudget > limits.tpm) {
+      return fail("prompt_too_large", `This single model call exceeds the ${tier} plan's ${limits.tpm.toLocaleString()} TPM limit. Reduce the prompt or workspace context.`);
+    }
+    if (usedUserTokens + requestedBudget > limits.tpm) {
+      return fail("token_limit", `Your ${tier} plan's token allowance is busy. Kite will retry when capacity is available.`, nextWindowForTokens(userTokenEvents, requestedBudget, limits.tpm));
     }
 
-    await tx
-      .update(accountCredits)
-      .set({
-        balance: account.balance - CREDITS_PER_REQUEST,
-        creditsUsed: account.creditsUsed + CREDITS_PER_REQUEST,
-        updatedAt: now,
-      })
-      .where(eq(accountCredits.userId, userId));
-    const [event] = await tx
-      .insert(generationEvents)
-      .values({
-        userId,
-        model: GEMINI_MODEL,
-        tokenBudget: requestedBudget,
-        chargedCredits: CREDITS_PER_REQUEST,
-        status: "reserved",
-      })
-      .returning({ id: generationEvents.id });
-
-    const quota: QuotaSnapshot = {
-      rate: { ...basicQuota.rate, used: quotaUsed + 1, remaining: Math.max(0, RATE_LIMIT_RPM - quotaUsed - 1) },
-      daily: { ...basicQuota.daily, used: todayUsed + 1, remaining: Math.max(0, DAILY_LIMIT_RPD - todayUsed - 1) },
-      tokens: { ...basicQuota.tokens, used: usedTokens + requestedBudget, remaining: Math.max(0, TOKEN_LIMIT_TPM - usedTokens - requestedBudget) },
+    const [event] = await tx.insert(generationEvents).values({
+      userId,
+      model: GEMINI_MODEL,
+      tokenBudget: requestedBudget,
+      chargedCredits: 0,
+      status: "reserved",
+    }).returning({ id: generationEvents.id });
+    const quota = {
+      ...userQuota,
+      tokens: { used: usedUserTokens + requestedBudget, limit: limits.tpm, remaining: Math.max(0, limits.tpm - usedUserTokens - requestedBudget), resetAt: userTokenReset },
     };
-    return {
-      ok: true as const,
-      eventId: event.id,
-      credits: accountSnapshot(account.balance - CREDITS_PER_REQUEST, account.creditsUsed + CREDITS_PER_REQUEST),
-      quota,
-    };
+    return { ok: true as const, eventId: event.id, credits, quota };
   });
 }
 
 export async function settleGeminiRequest(eventId: string, success: boolean, actualTokens: number) {
-  await db.transaction(async (tx) => {
-    const [event] = await tx
-      .select()
-      .from(generationEvents)
-      .where(eq(generationEvents.id, eventId))
-      .for("update");
-    if (!event || event.status !== "reserved") return;
-
-    await tx
-      .update(generationEvents)
-      .set({
-        status: success ? "completed" : "failed",
-        chargedCredits: success ? CREDITS_PER_REQUEST : 0,
-        tokenBudget: Math.max(0, Math.min(TOKEN_LIMIT_TPM, actualTokens || Math.max(1, event.tokenBudget - MAX_OUTPUT_TOKENS))),
-      })
-      .where(eq(generationEvents.id, eventId));
-
-    if (!success) {
-      const [account] = await tx
-        .select()
-        .from(accountCredits)
-        .where(eq(accountCredits.userId, event.userId))
-        .for("update");
-      if (account) {
-        await tx
-          .update(accountCredits)
-          .set({
-            balance: Math.min(INITIAL_CREDITS, account.balance + CREDITS_PER_REQUEST),
-            creditsUsed: Math.max(0, account.creditsUsed - CREDITS_PER_REQUEST),
-            updatedAt: new Date(),
-          })
-          .where(eq(accountCredits.userId, event.userId));
-      }
-    }
-  });
+  await db.update(generationEvents).set({
+    status: success ? "completed" : "failed",
+    chargedCredits: 0,
+    tokenBudget: Math.max(0, Math.min(TOKEN_LIMIT_TPM, actualTokens)),
+  }).where(and(eq(generationEvents.id, eventId), eq(generationEvents.status, "reserved")));
 }

@@ -61,6 +61,31 @@ export const providerLocks = pgTable("provider_locks", {
   touchedAt: timestamp("touched_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const studioDailyUsage = pgTable(
+  "studio_daily_usage",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    usageDate: text("usage_date").notNull(),
+    creditsUsed: integer("credits_used").notNull().default(0),
+    requestsUsed: integer("requests_used").notNull().default(0),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("studio_daily_usage_user_date_idx").on(table.userId, table.usageDate),
+  ],
+);
+
+export const studioRequestEvents = pgTable(
+  "studio_request_events",
+  {
+    id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
+    userId: text("user_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("studio_request_events_user_created_idx").on(table.userId, table.createdAt)],
+);
+
 export const workspaceFiles = pgTable(
   "workspace_files",
   {

@@ -1,40 +1,44 @@
-import { createClient, type User } from "@supabase/supabase-js";
+import { KITE_SESSION_COOKIE, verifyKiteSession } from "./kite-session";
 
-export type AuthenticatedUser = Pick<User, "id" | "email">;
+export type AccountTier = "free" | "go" | "plus" | "pro";
+export type AuthenticatedUser = { id: string; email?: string; tier: AccountTier };
 
-let authClient: ReturnType<typeof createClient> | null = null;
+const isTier = (tier: unknown): tier is AccountTier =>
+  tier === "free" || tier === "go" || tier === "plus" || tier === "pro";
 
-function getAuthClient() {
-  const url = process.env.SUPABASE_URL?.trim() || process.env.NEXT_PUBLIC_SUPABASE_URL?.trim();
-  const key =
-    process.env.SUPABASE_PUBLISHABLE_KEY?.trim() ||
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() ||
-    process.env.SUPABASE_ANON_KEY?.trim();
-  if (!url || !key) return null;
-  if (!authClient) {
-    authClient = createClient(url, key, {
-      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
-    });
+function readCookie(request: Request, name: string) {
+  const cookieHeader = request.headers.get("cookie") ?? "";
+  for (const part of cookieHeader.split(";")) {
+    const [key, ...value] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(value.join("="));
   }
-  return authClient;
+  return undefined;
 }
 
-/** Validates the caller's bearer token with Supabase Auth. Never trusts client-supplied user IDs. */
+/** Validates Kite's own HttpOnly session, then gets the current plan from PRV AI server-to-server. */
 export async function getAuthenticatedUser(request: Request): Promise<AuthenticatedUser | null> {
-  const token = request.headers.get("authorization")?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
-  if (!token) return null;
-  const client = getAuthClient();
-  if (!client) return null;
+  const session = verifyKiteSession(readCookie(request, KITE_SESSION_COOKIE));
+  const prvApiUrl = process.env.PRV_API_URL?.trim();
+  const sharedSecret = process.env.KITE_SSO_SHARED_SECRET?.trim();
+  if (!session || !prvApiUrl || !sharedSecret) return null;
 
   try {
-    const { data, error } = await client.auth.getUser(token);
-    if (error || !data.user) return null;
-    return { id: data.user.id, ...(data.user.email ? { email: data.user.email } : {}) };
+    const response = await fetch(new URL("/api/kite/entitlement", prvApiUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-kite-sso-secret": sharedSecret },
+      body: JSON.stringify({ prvUserId: session.sub }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json() as { tier?: unknown };
+    if (!isTier(payload.tier)) return null;
+    return { id: session.sub, ...(session.email ? { email: session.email } : {}), tier: payload.tier };
   } catch {
     return null;
   }
 }
 
 export function unauthorized() {
-  return Response.json({ error: "Sign in to continue." }, { status: 401 });
+  return Response.json({ error: "Sign in through PRV AI to continue." }, { status: 401 });
 }

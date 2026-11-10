@@ -85,10 +85,10 @@ export default function SettingsDialog({ open, onClose, config, rate, credits, q
               </div>
               <div className="rounded-lg border border-line bg-panel-2 px-2.5 py-2">
                 <p className="text-[9px] uppercase tracking-[0.14em] text-muted-dim">Per request</p>
-                <p className="mt-0.5 font-mono text-[11px] text-cream-soft">{credits.requestCost.toLocaleString()} credits · {credits.requestsUsed}/500 used</p>
+                <p className="mt-0.5 font-mono text-[11px] text-cream-soft">{credits.requestCost.toLocaleString()} credits · {credits.requestsUsed}/{Math.floor(credits.granted / credits.requestCost)} used</p>
               </div>
               <div className="rounded-lg border border-line bg-panel-2 px-2.5 py-2">
-                <p className="text-[9px] uppercase tracking-[0.14em] text-muted-dim">Shared today</p>
+                <p className="text-[9px] uppercase tracking-[0.14em] text-muted-dim">Requests today</p>
                 <p className="mt-0.5 font-mono text-[11px] text-cream-soft">{quota ? `${quota.daily.used} / ${quota.daily.limit}` : `0 / ${config.rpd}`}</p>
               </div>
               <div className="rounded-lg border border-line bg-panel-2 px-2.5 py-2">
@@ -97,7 +97,7 @@ export default function SettingsDialog({ open, onClose, config, rate, credits, q
               </div>
             </div>
             <p className="mt-2 text-[10.5px] leading-relaxed text-muted-dim">
-              Every account starts with 1,000,000 credits. Each model request costs 2,000 credits, for up to 500 requests per account. Larger projects may use several requests. The shared daily allowance resets at midnight Pacific Time.
+              Each submitted Kite generation turn, including plan-only replies, costs 2,000 credits regardless of output size. Daily credits follow your PRV AI plan, refresh at midnight UTC, and do not carry over. Internal model calls count toward your TPM limit.
             </p>
           </section>
 

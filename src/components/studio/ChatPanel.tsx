@@ -236,7 +236,7 @@ function ThinkingCard({ thinking, config }: { thinking: ThinkingState; config: E
 
           {!config.configured ? (
             <p className="mt-2.5 border-t border-line pt-2 text-[10px] leading-relaxed text-muted-dim">
-              Opal o1 flash is unavailable, so Kite's local composer is handling this run.
+              Opal o1 flash is unavailable, so Kite&apos;s local composer is handling this run.
               The workspace will switch back automatically when the engine is ready.
             </p>
           ) : null}
@@ -313,6 +313,11 @@ export default function ChatPanel({
       </div>
 
       <div className="border-t border-line bg-shell/80 px-3 pb-4 pt-3">
+        {detail.files.length > 0 ? (
+          <p className="mb-2 px-1 text-[10px] leading-relaxed text-muted-dim">
+            Project context is attached. Paste a README or terminal error here and Kite can use this project’s brief and saved files to fix it.
+          </p>
+        ) : null}
         <Composer
           onSubmit={onSend}
           busy={busy}

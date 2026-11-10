@@ -33,9 +33,9 @@ export async function POST(request: Request, { params }: Params) {
     const project = await getProjectDetail(id, user.id);
     if (!project) return Response.json({ error: "Project not found" }, { status: 404 });
 
-    const outcome = await runAgent(id, user.id, prompt, { planOnly });
+    const outcome = await runAgent(id, user.id, prompt, { planOnly, tier: user.tier });
     if (!outcome) return Response.json({ error: "Agent run failed" }, { status: 500 });
-    const [quota, credits] = await Promise.all([getQuotaSnapshot(), getCreditSnapshot(user.id)]);
+    const [quota, credits] = await Promise.all([getQuotaSnapshot(user.id, user.tier), getCreditSnapshot(user.id, user.tier)]);
     return Response.json({
       detail: outcome.detail,
       rate: quota.rate,
@@ -55,7 +55,7 @@ export async function POST(request: Request, { params }: Params) {
     }
     if (err.message === "GEMINI_RATE_LIMITED") {
       try {
-        const [quota, credits] = await Promise.all([getQuotaSnapshot(), getCreditSnapshot(user.id)]);
+        const [quota, credits] = await Promise.all([getQuotaSnapshot(user.id, user.tier), getCreditSnapshot(user.id, user.tier)]);
         return Response.json(
           {
             error: "rate_limited",

@@ -157,6 +157,39 @@ export const Refresh = (p: IconProps) => (
   </Base>
 );
 
+export const Play = (p: IconProps) => (
+  <Base {...p}>
+    <path d="m8 5 11 7-11 7V5Z" />
+  </Base>
+);
+
+export const Square = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="6" y="6" width="12" height="12" rx="1.5" />
+  </Base>
+);
+
+export const Terminal = (p: IconProps) => (
+  <Base {...p}>
+    <rect x="3" y="4" width="18" height="16" rx="2" />
+    <path d="m7 9 3 3-3 3m6 0h4" />
+  </Base>
+);
+
+export const ExternalLink = (p: IconProps) => (
+  <Base {...p}>
+    <path d="M14 4h6v6m0-6-9 9" />
+    <path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5" />
+  </Base>
+);
+
+export const Alert = (p: IconProps) => (
+  <Base {...p}>
+    <path d="M12 3 2.8 19h18.4L12 3Z" />
+    <path d="M12 9v4m0 3h.01" />
+  </Base>
+);
+
 export const PanelLeft = (p: IconProps) => (
   <Base {...p}>
     <rect x="3" y="4" width="18" height="16" rx="2" />

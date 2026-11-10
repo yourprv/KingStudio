@@ -226,6 +226,22 @@ button {
   mask-image: radial-gradient(circle at 50% 0%, black, transparent 72%);
 }
 
+.home-aurora {
+  background:
+    radial-gradient(ellipse at 50% 16%, rgba(87, 126, 255, 0.42), transparent 42%),
+    radial-gradient(ellipse at 70% 54%, rgba(208, 72, 214, 0.3), transparent 43%),
+    radial-gradient(ellipse at 31% 55%, rgba(255, 55, 153, 0.34), transparent 43%),
+    linear-gradient(180deg, rgba(45, 51, 91, 0.22), transparent 100%);
+  mask-image: linear-gradient(to bottom, black 0%, rgba(0, 0, 0, 0.9) 46%, transparent 100%);
+}
+
+.home-title-gradient {
+  background: linear-gradient(100deg, #d9c7ff 6%, #9eb7ff 44%, #ff9bd7 92%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
 .no-scrollbar::-webkit-scrollbar {
   display: none;
 }

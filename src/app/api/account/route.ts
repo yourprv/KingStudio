@@ -12,10 +12,10 @@ export async function GET(request: Request) {
 
   try {
     const [credits, quota] = await Promise.all([
-      getCreditSnapshot(user.id),
-      getQuotaSnapshot(),
+      getCreditSnapshot(user.id, user.tier),
+      getQuotaSnapshot(user.id, user.tier),
     ]);
-    return Response.json({ user: { id: user.id, email: user.email }, credits, quota });
+    return Response.json({ user: { id: user.id, email: user.email, tier: user.tier }, credits, quota });
   } catch (error) {
     return safeApiFailure(error, "Could not load account credits.");
   }

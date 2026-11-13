@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { apiFetch } from "@/lib/supabase/client";
 
 const PRV_LOGIN_URL = "https://prvai.vercel.app/";
@@ -10,40 +10,42 @@ export default function AuthGate({ children, databaseConfigured }: { children: R
   const [ready, setReady] = useState(false);
   const [message, setMessage] = useState("Open Kite Studio from PRV AI to sign in automatically.");
   const [busy, setBusy] = useState(false);
+  const ssoExchangeRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     if (!databaseConfigured) return;
     let cancelled = false;
-    const validateCookie = async () => {
-      try {
-        const response = await apiFetch("/api/account", { cache: "no-store" });
-        if (response.ok && !cancelled) {
-          setAuthenticated(true);
-          setReady(true);
-          return;
-        }
-      } catch {
-        // A direct visit without a Kite session continues to the sign-in handoff.
-      }
-
-      const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-      const code = params.get("sso");
-      if (code) {
-        window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
-        setBusy(true);
-        try {
-          const response = await apiFetch("/api/auth/sso/exchange", {
+    const exchangeCode = (code: string) => {
+      if (!ssoExchangeRef.current) {
+        ssoExchangeRef.current = (async () => {
+          const response = await apiFetch("/sso/exchange", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code }),
           });
           if (!response.ok) {
             const payload = await response.json().catch(() => null) as { error?: unknown } | null;
-            const message = typeof payload?.error === "string"
+            const error = typeof payload?.error === "string"
               ? payload.error
               : "Kite could not verify this PRV AI sign-in. Open Kite again from PRV AI.";
-            throw new Error(message);
+            throw new Error(error);
           }
+        })();
+      }
+      return ssoExchangeRef.current;
+    };
+
+    const validateSessionOrExchangeCode = async () => {
+      const params = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const code = params.get("sso");
+      if (code) {
+        window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+      }
+
+      if (code || ssoExchangeRef.current) {
+        setBusy(true);
+        try {
+          await (code ? exchangeCode(code) : ssoExchangeRef.current);
           if (!cancelled) setAuthenticated(true);
         } catch (error) {
           if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not verify the PRV AI sign-in.");
@@ -55,9 +57,20 @@ export default function AuthGate({ children, databaseConfigured }: { children: R
         }
         return;
       }
+
+      try {
+        const response = await apiFetch("/api/account", { cache: "no-store" });
+        if (response.ok && !cancelled) {
+          setAuthenticated(true);
+          setReady(true);
+          return;
+        }
+      } catch {
+        // A direct visit without a Kite session continues to the sign-in handoff.
+      }
       if (!cancelled) setReady(true);
     };
-    void validateCookie();
+    void validateSessionOrExchangeCode();
     return () => { cancelled = true; };
   }, [databaseConfigured]);
 

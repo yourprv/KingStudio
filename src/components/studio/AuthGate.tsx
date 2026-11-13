@@ -37,7 +37,13 @@ export default function AuthGate({ children, databaseConfigured }: { children: R
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ code }),
           });
-          if (!response.ok) throw new Error("This PRV AI sign-in link expired. Open Kite again from PRV AI.");
+          if (!response.ok) {
+            const payload = await response.json().catch(() => null) as { error?: unknown } | null;
+            const message = typeof payload?.error === "string"
+              ? payload.error
+              : "Kite could not verify this PRV AI sign-in. Open Kite again from PRV AI.";
+            throw new Error(message);
+          }
           if (!cancelled) setAuthenticated(true);
         } catch (error) {
           if (!cancelled) setMessage(error instanceof Error ? error.message : "Could not verify the PRV AI sign-in.");

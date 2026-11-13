@@ -32,7 +32,12 @@ export async function POST(request: Request) {
       signal: AbortSignal.timeout(8_000),
     });
     if (!response.ok) {
-      return Response.json({ error: "This PRV AI sign-in link has expired or was already used." }, { status: 401 });
+      const payload = await response.json().catch(() => null) as { error?: unknown } | null;
+      const message = typeof payload?.error === "string"
+        ? payload.error
+        : `PRV AI sign-in service returned HTTP ${response.status}.`;
+      const status = response.status === 401 ? 401 : response.status === 503 ? 503 : 502;
+      return Response.json({ error: message }, { status });
     }
     const payload = await response.json() as { user?: { id?: unknown; email?: unknown } };
     const user = payload.user;
